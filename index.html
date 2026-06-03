@@ -1,0 +1,1208 @@
+<html>
+<head>
+<title>WebGL Sand Simulation</title>
+<meta http-equiv="content-type" content="text/html; charset=utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; overflow:hidden; font-family: 'Courier New', monospace; }
+  #the-canvas { display:block; width:100vw; height:100vh; cursor:crosshair; }
+  #ui {
+    position:fixed; top:0; left:0; width:220px; min-height:100vh;
+    background: rgba(8,5,2,0.88);
+    border-right: 1px solid rgba(180,130,50,0.2);
+    backdrop-filter: blur(6px);
+    padding:16px 14px;
+    display:flex; flex-direction:column; gap:10px;
+    z-index:100;
+  }
+  h1 {
+    font-size:36px; letter-spacing:8px; color:#c8903a;
+    font-family:Georgia,serif; font-weight:normal;
+    text-shadow: 0 0 20px rgba(200,144,58,0.5);
+    line-height:1;
+  }
+  .sub { font-size:8px; letter-spacing:3px; color:rgba(200,160,80,0.4); text-transform:uppercase; margin-top:2px; }
+  .sep { border:none; border-top:1px solid rgba(180,130,50,0.15); margin:4px 0; }
+  label { font-size:8px; letter-spacing:2px; color:rgba(200,160,80,0.5); text-transform:uppercase; display:flex; flex-direction:column; gap:4px; }
+  input[type=range] { -webkit-appearance:none; width:100%; height:2px; background:rgba(180,130,50,0.2); outline:none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:10px; height:10px; border-radius:50%; background:#c8903a; cursor:pointer; box-shadow:0 0 6px rgba(200,144,58,0.6); }
+  .val { color:#e0b060; font-size:9px; align-self:flex-end; }
+  .row { display:flex; gap:5px; flex-wrap:wrap; }
+  .btn {
+    background:transparent; border:1px solid rgba(180,130,50,0.25); color:rgba(200,160,80,0.5);
+    font-family:'Courier New',monospace; font-size:8px; padding:6px 4px; cursor:pointer;
+    transition:all 0.12s; text-align:center; flex:1;
+    letter-spacing:0.5px;
+  }
+  .btn:hover { border-color:#c8903a; color:#c8903a; background:rgba(200,144,58,0.08); }
+  .btn.on { border-color:#c8903a; color:#e0b060; background:rgba(200,144,58,0.14); box-shadow:inset 0 0 6px rgba(200,144,58,0.1); }
+  #fps-box { font-size:9px; color:rgba(200,160,80,0.4); display:flex; justify-content:space-between; border-top:1px solid rgba(180,130,50,0.1); padding-top:8px; }
+  #fps { color:#c8903a; }
+  .hint { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
+    font-size:8px; letter-spacing:3px; text-transform:uppercase; color:rgba(200,160,80,0.3);
+    pointer-events:none; white-space:nowrap; }
+  .seclabel { font-size:7px; letter-spacing:2.5px; color:rgba(200,160,80,0.3); text-transform:uppercase; margin-top:2px; }
+</style>
+
+<!-- ═══════════════════ SHADERS ═══════════════════ -->
+
+<!-- Pool walls vertex -->
+<script id="pool-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  attribute vec3 aVertexNormal;
+  attribute vec2 aTextureCoord;
+  uniform mat4 uMVMatrix;
+  uniform mat4 uPMatrix;
+  uniform mat4 uNmlMatrix;
+  uniform mat4 uLightMatrix;
+  uniform mat4 uLightProj;
+  varying vec3 vVertexNormal;
+  varying vec3 vVertexPosition;
+  varying vec4 vLightCoord;
+  varying vec2 vTexCoord;
+  const mat4 ScaleMatrix = mat4(0.5,0,0,0, 0,0.5,0,0, 0,0,0.5,0, 0.5,0.5,0.5,1.0);
+  void main(void) {
+    gl_Position = uPMatrix * uMVMatrix * vec4(aVertexPosition, 1.0);
+    vVertexNormal = (uNmlMatrix * vec4(aVertexNormal, 0.0)).xyz;
+    vVertexPosition = aVertexPosition;
+    vLightCoord = ScaleMatrix * uLightProj * uLightMatrix * vec4(aVertexPosition, 1.0);
+    vTexCoord = aTextureCoord;
+  }
+</script>
+
+<!-- Pool walls fragment — sand-coloured dune floor -->
+<script id="pool-fs" type="x-shader/x-fragment">
+  precision highp float;
+  uniform sampler2D uSamplerTile;
+  uniform sampler2D uSamplerWater;
+  uniform sampler2D uSamplerDepth;
+  uniform float uSphereRadius;
+  uniform vec3 uSphereCenter;
+  uniform float uCausticOn;
+  uniform int uIsSphere;
+  varying vec3 vVertexNormal;
+  varying vec3 vVertexPosition;
+  varying vec4 vLightCoord;
+  varying vec2 vTexCoord;
+  vec3 lightDir = normalize(vec3(0.6, 1.2, 0.4));
+
+  // Simple sand colour from texture coords
+  vec3 sandColor(vec2 uv) {
+    float n = fract(sin(dot(uv*7.3, vec2(12.9898,78.233))) * 43758.5453);
+    float n2 = fract(sin(dot(uv*3.1, vec2(19.23,43.11))) * 12345.678);
+    vec3 base = mix(vec3(0.72,0.54,0.28), vec3(0.85,0.68,0.38), n);
+    base = mix(base, vec3(0.65,0.48,0.22), n2*0.3);
+    return base;
+  }
+
+  void main(void) {
+    vec2 coord = vVertexPosition.xz * 0.5 + 0.5;
+    vec4 water = texture2D(uSamplerWater, coord);
+
+    vec3 normal = normalize(vVertexNormal);
+    float diff = clamp(dot(lightDir, normal), 0.1, 1.0);
+
+    // Shadow
+    float shadow = 1.0;
+    if (vLightCoord.w > 0.0) {
+      vec2 lCoord = vLightCoord.xy / vLightCoord.w;
+      if (lCoord.x>0.0 && lCoord.x<1.0 && lCoord.y>0.0 && lCoord.y<1.0) {
+        float depth = texture2D(uSamplerDepth, lCoord).r;
+        float z = vLightCoord.z / vLightCoord.w;
+        if (z > depth + 0.005) shadow = 0.4;
+      }
+    }
+
+    // Sand diffuse
+    vec2 tuv = vTexCoord * 4.0;
+    vec3 tileCol = texture2D(uSamplerTile, tuv).rgb;
+    // Blend tile texture with sand colour
+    vec3 sand = mix(sandColor(vTexCoord), tileCol, 0.4);
+    // Sphere indent shadow
+    float toSphere = length(vVertexPosition - vec3(uSphereCenter.x, vVertexPosition.y, uSphereCenter.z));
+    float sIndent = 1.0 - smoothstep(0.0, uSphereRadius * 1.5, toSphere);
+    sand *= (1.0 - sIndent * 0.25);
+
+    gl_FragColor = vec4(sand * diff * shadow, 1.0);
+  }
+</script>
+
+<!-- Sky vertex -->
+<script id="sky-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  uniform mat4 uMVMatrix;
+  uniform mat4 uPMatrix;
+  varying vec3 vDir;
+  void main(void) {
+    gl_Position = uPMatrix * uMVMatrix * vec4(aVertexPosition, 1.0);
+    vDir = aVertexPosition;
+  }
+</script>
+<script id="sky-fs" type="x-shader/x-fragment">
+  precision mediump float;
+  uniform samplerCube uSamplerSky;
+  varying vec3 vDir;
+  void main(void) {
+    gl_FragColor = textureCube(uSamplerSky, vDir);
+  }
+</script>
+
+<!-- Sphere / object vertex -->
+<script id="obj-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  attribute vec3 aVertexNormal;
+  uniform mat4 uMVMatrix;
+  uniform mat4 uPMatrix;
+  uniform vec3 uCenter;
+  varying vec3 vNormal;
+  varying vec3 vPos;
+  void main(void) {
+    vec3 pos = aVertexPosition + uCenter;
+    gl_Position = uPMatrix * uMVMatrix * vec4(pos, 1.0);
+    vNormal = aVertexNormal;
+    vPos = pos;
+  }
+</script>
+<script id="obj-fs" type="x-shader/x-fragment">
+  precision mediump float;
+  uniform sampler2D uSamplerWater;
+  uniform float uSphereRadius;
+  uniform vec3 uSphereCenter;
+  uniform int uIsSphere;
+  varying vec3 vNormal;
+  varying vec3 vPos;
+  vec3 lightDir = normalize(vec3(0.6,1.2,0.4));
+  void main(void) {
+    vec3 n = normalize(vNormal);
+    float diff = clamp(dot(lightDir, n), 0.15, 1.0);
+    // Chrome-like sphere — warm metallic sand-pearl
+    vec3 baseColor = vec3(0.88, 0.75, 0.55);
+    vec3 col = baseColor * diff;
+    // specular
+    vec3 h = normalize(lightDir + normalize(vec3(0,3,3)));
+    float spec = pow(max(dot(n, h), 0.0), 64.0);
+    col += vec3(1.0, 0.95, 0.8) * spec * 0.8;
+    gl_FragColor = vec4(col, 1.0);
+  }
+</script>
+
+<!-- Sand surface vertex — displaces by height map -->
+<script id="sand-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  attribute vec3 aVertexNormal;
+  uniform mat4 uMVMatrix;
+  uniform mat4 uPMatrix;
+  uniform mat4 uNmlMatrix;
+  uniform sampler2D uSamplerWater;
+  uniform mat4 uReflectpMatrix;
+  uniform mat4 uReflectmvMatrix;
+  varying vec3 vVertexPosition;
+  varying vec3 vNormal;
+  const mat4 ScaleMatrix = mat4(1.0,0,0,0, 0,1.0,0,0, 0,0,1.0,0, 0.5,0.5,0.5,1.0);
+  void main(void) {
+    vec4 data = texture2D(uSamplerWater, aVertexPosition.xy * 0.5 + 0.5);
+    vVertexPosition = aVertexPosition.xzy;
+    vVertexPosition.y += data.r;
+    vNormal = vec3(data.g, sqrt(max(0.0, 1.0 - dot(data.gb, data.gb))), data.b);
+    gl_Position = uPMatrix * uMVMatrix * vec4(vVertexPosition, 1.0);
+  }
+</script>
+
+<!-- Sand surface fragment — grain texture + lighting -->
+<script id="sand-fs" type="x-shader/x-fragment">
+  precision highp float;
+  uniform sampler2D uSamplerTile;
+  uniform sampler2D uSamplerWater;
+  uniform vec3 uEyePosition;
+  uniform float uSphereRadius;
+  uniform vec3 uSphereCenter;
+  uniform int uProgNum;
+  varying vec3 vVertexPosition;
+  varying vec3 vNormal;
+
+  vec3 lightDir = normalize(vec3(0.6, 1.2, 0.4));
+  const float IOR_AIR = 1.0;
+  const float IOR_SAND = 1.5;
+
+  // Sand grain noise
+  float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+  }
+  float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+               mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+  }
+
+  vec3 getSandColor(vec3 p) {
+    vec2 uv = p.xz * 6.0;
+    float n1 = noise(uv);
+    float n2 = noise(uv * 2.3 + vec2(5.2, 1.3));
+    float n3 = noise(uv * 5.7 + vec2(9.1, 2.8));
+    float grain = n1*0.5 + n2*0.3 + n3*0.2;
+    vec3 sand1 = vec3(0.80, 0.62, 0.30);
+    vec3 sand2 = vec3(0.68, 0.50, 0.22);
+    vec3 sand3 = vec3(0.90, 0.75, 0.45);
+    vec3 col = mix(sand1, sand2, grain);
+    col = mix(col, sand3, n3 * 0.3);
+    return col;
+  }
+
+  void main(void) {
+    vec3 n = normalize(vNormal);
+    float diff = clamp(dot(lightDir, n), 0.15, 1.0);
+
+    vec3 eyeDir = normalize(vVertexPosition - uEyePosition);
+    float fresnel = pow(1.0 - clamp(dot(-eyeDir, n), 0.0, 1.0), 3.0);
+
+    vec3 sandCol = getSandColor(vVertexPosition);
+
+    // Specular highlight (dry sand sheen)
+    vec3 h = normalize(lightDir - eyeDir);
+    float spec = pow(max(dot(n, h), 0.0), 12.0) * 0.15;
+    sandCol += vec3(1.0, 0.9, 0.7) * spec;
+
+    // Ambient occlusion approximation from height
+    vec4 data = texture2D(uSamplerWater, vVertexPosition.xz * 0.5 + 0.5);
+    float ao = 1.0 - clamp(data.r * 0.5, 0.0, 0.4);
+
+    // Sphere shadow indent
+    float toSph = length(vVertexPosition.xz - uSphereCenter.xz);
+    float sHalo = 1.0 - smoothstep(0.0, uSphereRadius * 2.0, toSph);
+    sandCol *= (1.0 - sHalo * 0.18);
+
+    gl_FragColor = vec4(sandCol * diff * ao, 1.0);
+  }
+</script>
+
+<!-- Depth vertex / fragment (shadow map) -->
+<script id="depth-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  attribute vec3 aVertexNormal;
+  uniform mat4 uMVMatrix;
+  uniform mat4 uPMatrix;
+  uniform vec3 uCenter;
+  uniform int uMode;
+  varying vec3 vPos;
+  void main(void) {
+    vec3 pos = aVertexPosition + uCenter;
+    gl_Position = uPMatrix * uMVMatrix * vec4(pos, 1.0);
+    vPos = gl_Position.xyz;
+  }
+</script>
+<script id="depth-fs" type="x-shader/x-fragment">
+  precision highp float;
+  varying vec3 vPos;
+  vec3 lightDir = normalize(vec3(0.6,1.2,0.4));
+  void main(void) {
+    gl_FragColor = vec4(vec3(gl_FragCoord.z), 1.0);
+  }
+</script>
+
+<!-- Fullscreen quad vertex -->
+<script id="quad-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  attribute vec2 aTextureCoord;
+  varying vec2 vCoord;
+  void main(void) {
+    vCoord = aTextureCoord;
+    gl_Position = vec4(aVertexPosition, 1.0);
+  }
+</script>
+<script id="quad-fs" type="x-shader/x-fragment">
+  precision highp float;
+  uniform sampler2D uSamplerDepth;
+  uniform int uMode;
+  varying vec2 vCoord;
+  void main(void) {
+    gl_FragColor = vec4(texture2D(uSamplerDepth, vCoord).rgb, 1.0);
+  }
+</script>
+
+<!-- interact-vs: shared for all simulation passes -->
+<script id="interact-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  varying vec2 vCoord;
+  void main(void) {
+    vCoord = aVertexPosition.xy * 0.5 + 0.5;
+    gl_Position = vec4(aVertexPosition, 1.0);
+  }
+</script>
+
+<!-- Height update — mouse drag -->
+<script id="interact-height-fs" type="x-shader/x-fragment">
+  precision highp float;
+  const float PI = 3.141592653589793;
+  uniform sampler2D uSamplerWater;
+  uniform vec2 uCenter;
+  uniform float uRadius;
+  uniform float uStrength;
+  varying vec2 vCoord;
+  void main() {
+    vec4 data = texture2D(uSamplerWater, vCoord);
+    vec2 dragCoord = uCenter * 0.5 + 0.5;
+    float dist = length(dragCoord - vCoord);
+    float drag = max(0.0, 1.0 - dist / uRadius);
+    drag = 0.5 - cos(drag * PI) * 0.5;
+    data.x += drag * uStrength;
+    gl_FragColor = data;
+  }
+</script>
+
+<!-- Normal recalculation -->
+<script id="interact-normal-fs" type="x-shader/x-fragment">
+  precision mediump float;
+  uniform sampler2D uSamplerWater;
+  uniform vec2 uDelta;
+  varying vec2 vCoord;
+  void main() {
+    vec4 data = texture2D(uSamplerWater, vCoord);
+    vec3 dx = vec3(uDelta.x, texture2D(uSamplerWater, vec2(vCoord.x+uDelta.x, vCoord.y)).r - data.r, 0.0);
+    vec3 dy = vec3(0.0, texture2D(uSamplerWater, vec2(vCoord.x, vCoord.y+uDelta.y)).r - data.r, uDelta.y);
+    data.gb = normalize(cross(dy, dx)).xz;
+    gl_FragColor = data;
+  }
+</script>
+
+<!-- Wave simulation — SAND: higher damping, lower wave speed -->
+<script id="interact-simulate-fs" type="x-shader/x-fragment">
+  precision mediump float;
+  uniform sampler2D uSamplerWater;
+  uniform vec2 uDelta;
+  uniform float uDamping;
+  varying vec2 vCoord;
+  void main() {
+    vec4 data = texture2D(uSamplerWater, vCoord);
+    vec2 dx = vec2(uDelta.x, 0.0);
+    vec2 dy = vec2(0.0, uDelta.y);
+    float average = 0.25 * (
+      texture2D(uSamplerWater, vCoord - dx).r +
+      texture2D(uSamplerWater, vCoord - dy).r +
+      texture2D(uSamplerWater, vCoord + dx).r +
+      texture2D(uSamplerWater, vCoord + dy).r);
+    data.a += (average - data.r) * 1.8;   // slower wave speed than water
+    data.a *= uDamping;                    // stronger damping => sand settles fast
+    data.r += data.a;
+    gl_FragColor = data;
+  }
+</script>
+
+<!-- Sphere interaction -->
+<script id="interact-sphere-fs" type="x-shader/x-fragment">
+  precision mediump float;
+  uniform sampler2D uSamplerWater;
+  uniform vec3 uOldCenter;
+  uniform vec3 uNewCenter;
+  uniform float uRadius;
+  varying vec2 vCoord;
+  float volumeInSphere(vec3 center) {
+    vec3 toCenter = vec3(vCoord.x*2.0-1.0, 0.0, vCoord.y*2.0-1.0) - center;
+    float t = length(toCenter) / uRadius;
+    float dy = exp(-pow(t*1.5, 6.0));
+    float ymin = min(0.0, center.y - dy);
+    float ymax = min(max(0.0, center.y + dy), ymin + 2.0*dy);
+    return (ymax - ymin) * 0.06;
+  }
+  void main() {
+    vec4 data = texture2D(uSamplerWater, vCoord);
+    data.r += volumeInSphere(uOldCenter);
+    data.r -= volumeInSphere(uNewCenter);
+    gl_FragColor = data;
+  }
+</script>
+
+<!-- Wind (perlin) — sand drift -->
+<script id="perlin-vs" type="x-shader/x-vertex">
+  attribute vec3 aVertexPosition;
+  uniform float uTime;
+  uniform sampler2D uSamplerPerm;
+  uniform sampler2D uSamplerGrad;
+  varying float vHeight;
+  varying vec2 vCoord;
+  vec3 fade(vec3 t) { return t*t*t*(t*(t*6.0-15.0)+10.0); }
+  float perm(float x) { return texture2D(uSamplerPerm, vec2(x/256.0,0.0)).a*256.0; }
+  float grad(float x, vec3 pp) { return dot(texture2D(uSamplerGrad, vec2(x,0.0)).rgb, pp); }
+  float noise(vec3 p) {
+    vec3 point = mod(floor(p), 256.0);
+    p -= floor(p);
+    vec3 fa = fade(p);
+    float A=perm(point.x)+point.y; float AA=perm(A)+point.z; float AB=perm(A+1.0)+point.z;
+    float B=perm(point.x+1.0)+point.y; float BA=perm(B)+point.z; float BB=perm(B+1.0)+point.z;
+    return mix(mix(mix(grad(perm(AA),p),grad(perm(BA),p+vec3(-1,0,0)),fa.x),
+                   mix(grad(perm(AB),p+vec3(0,-1,0)),grad(perm(BB),p+vec3(-1,-1,0)),fa.x),fa.y),
+               mix(mix(grad(perm(AA+1.0),p+vec3(0,0,-1)),grad(perm(BA+1.0),p+vec3(-1,0,-1)),fa.x),
+                   mix(grad(perm(AB+1.0),p+vec3(0,-1,-1)),grad(perm(BB+1.0),p+vec3(-1,-1,-1)),fa.x),fa.y),fa.z);
+  }
+  void main(void) {
+    vCoord = aVertexPosition.xy*0.5+0.5;
+    vHeight = noise(vec3(aVertexPosition.xy*3.0, uTime));
+    gl_Position = vec4(aVertexPosition,1.0);
+  }
+</script>
+<script id="perlin-fs" type="x-shader/x-fragment">
+  precision mediump float;
+  uniform sampler2D uSamplerWater;
+  varying float vHeight;
+  varying vec2 vCoord;
+  void main() {
+    vec4 data = texture2D(uSamplerWater, vCoord);
+    data.a += vHeight * 0.003;   // gentle sand drift
+    gl_FragColor = data;
+  }
+</script>
+
+<!-- ═══════════════════ JS ═══════════════════ -->
+<script src="glMatrix-0.9.5.js"></script>
+<script src="webgl-utils.js"></script>
+<script src="tracer.js"></script>
+<script src="primitives.js"></script>
+<script src="dat.gui.min.js"></script>
+</head>
+
+<body onload="webGLStart()">
+
+<canvas id="the-canvas"></canvas>
+
+<div id="ui">
+  <h1>SAND</h1>
+  <span class="sub">WebGL Physics</span>
+  <hr class="sep">
+
+  <label>Sphere Radius
+    <input type="range" id="srad" min="0.05" max="0.35" step="0.01" value="0.18">
+    <span class="val" id="srad-val">0.18</span>
+  </label>
+
+  <label>Sand Damping
+    <input type="range" id="damp" min="0.960" max="0.998" step="0.001" value="0.980">
+    <span class="val" id="damp-val">0.980</span>
+  </label>
+
+  <label>Disturbance
+    <input type="range" id="strength" min="0.005" max="0.08" step="0.005" value="0.02">
+    <span class="val" id="strength-val">0.02</span>
+  </label>
+
+  <div class="seclabel">Effects</div>
+  <div class="row">
+    <button class="btn on" id="btn-wind">Wind</button>
+    <button class="btn" id="btn-rain">Rain</button>
+  </div>
+
+  <div class="seclabel">Debug</div>
+  <div class="row">
+    <button class="btn" id="btn-depth">Depth</button>
+  </div>
+
+  <div class="row">
+    <button class="btn" id="btn-clear" style="flex:unset;width:100%">Clear Sand</button>
+  </div>
+
+  <div id="fps-box">
+    <span>FPS</span><span id="fps">—</span>
+  </div>
+</div>
+
+<div class="hint">LMB drag: disturb sand &nbsp;|&nbsp; RMB drag: rotate &nbsp;|&nbsp; Scroll: zoom</div>
+
+<script>
+"use strict";
+var gl;
+var tracer = {};
+
+var OES_texture_float, OES_texture_float_linear, OES_standard_derivatives, WEBGL_depth_texture;
+
+var poolProg, skyProg, sandProg = [], heightProg, normalProg, simulateProg, objectProg, depthProg, windProg, quadProg;
+
+var framebuffer, renderbuffer;
+var textureSize = 256;
+var textureSize2 = 512;
+
+var mvMatrix = mat4.create();
+var mvMatrixStack = [];
+var pMatrix = mat4.create();
+var nmlMatrix = mat4.create();
+var radius = 4.0, azimuth = 0.5*Math.PI, elevation = 0.5, fov = 45.0;
+var eye, center = [0,0,0], up = [0,1,0], view = mat4.create();
+
+var numFramesToAverage = 16, frameTimeHistory = [], frameTimeIndex = 0, totalTimeForFrames = 0;
+var then = Date.now()/1000, accumTime = 0;
+
+var mouseLeftDown = false, mouseRightDown = false;
+var lastMouseX = null, lastMouseY = null;
+var preHit = vec3.create(0.0), viewportNormal = vec3.create(0.0);
+var mode = 0;
+
+var pool = {}, sky = {}, sand = {}, quad = {}, sphere = {};
+var depthTexture, colorTexture, depthTexture2, colorTexture2;
+var lightInvDir = vec3.normalize(vec3.create([0.6,1.2,0.4]));
+var lightMatrix = mat4.create(), lightProj = mat4.create();
+
+var permTexture, gradTexture;
+var sphereRadius = 0.18;
+var rainCounter = 0;
+
+var params = {
+  Wind: true,
+  Rain: false,
+  Depth_From_Light: false,
+  Damping: 0.980,
+  Strength: 0.02,
+};
+
+var perm = [151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180];
+var grad = [1,1,0,-1,1,0,1,-1,0,-1,-1,0,1,0,1,-1,0,1,1,0,-1,-1,0,-1,0,1,1,0,-1,1,0,1,-1,0,-1,-1,1,1,0,0,-1,1,-1,1,0,0,-1,-1];
+
+function sphericalToCartesian(r,a,e) { return [r*Math.cos(e)*Math.cos(a), r*Math.sin(e), r*Math.cos(e)*Math.sin(a)]; }
+
+function initGL(canvas) {
+  try { gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl"); gl.viewportWidth=canvas.width; gl.viewportHeight=canvas.height; }
+  catch(e) {}
+  if(!gl) alert("WebGL not available");
+}
+
+function getShader(gl, id) {
+  var s = document.getElementById(id); if(!s) return null;
+  var str="", k=s.firstChild;
+  while(k) { if(k.nodeType==3) str+=k.textContent; k=k.nextSibling; }
+  var sh = gl.createShader(s.type=="x-shader/x-fragment"?gl.FRAGMENT_SHADER:gl.VERTEX_SHADER);
+  gl.shaderSource(sh,str); gl.compileShader(sh);
+  if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) { alert(gl.getShaderInfoLog(sh)); return null; }
+  return sh;
+}
+
+function createProg(vsId, fsId) {
+  var prog = gl.createProgram();
+  gl.attachShader(prog, getShader(gl,vsId));
+  gl.attachShader(prog, getShader(gl,fsId));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) { alert("Shader link fail: "+vsId+" "+fsId); }
+  return prog;
+}
+
+function initShaders() {
+  // Pool
+  poolProg = createProg("pool-vs","pool-fs");
+  gl.useProgram(poolProg);
+  poolProg.vertexPositionAttribute = gl.getAttribLocation(poolProg,"aVertexPosition");
+  poolProg.vertexNormalAttribute   = gl.getAttribLocation(poolProg,"aVertexNormal");
+  poolProg.textureCoordAttribute   = gl.getAttribLocation(poolProg,"aTextureCoord");
+  poolProg.pMatrixUniform   = gl.getUniformLocation(poolProg,"uPMatrix");
+  poolProg.mvMatrixUniform  = gl.getUniformLocation(poolProg,"uMVMatrix");
+  poolProg.nmlMatrixUniform = gl.getUniformLocation(poolProg,"uNmlMatrix");
+  poolProg.lightMatrixUniform = gl.getUniformLocation(poolProg,"uLightMatrix");
+  poolProg.lightProjUniform   = gl.getUniformLocation(poolProg,"uLightProj");
+  poolProg.samplerTileUniform  = gl.getUniformLocation(poolProg,"uSamplerTile");
+  poolProg.samplerWaterUniform = gl.getUniformLocation(poolProg,"uSamplerWater");
+  poolProg.samplerDepthUniform = gl.getUniformLocation(poolProg,"uSamplerDepth");
+  poolProg.sphereRadiusUniform = gl.getUniformLocation(poolProg,"uSphereRadius");
+  poolProg.sphereCenterUniform = gl.getUniformLocation(poolProg,"uSphereCenter");
+  poolProg.causticOnUniform    = gl.getUniformLocation(poolProg,"uCausticOn");
+  poolProg.isSphereUniform     = gl.getUniformLocation(poolProg,"uIsSphere");
+
+  // Sky
+  skyProg = createProg("sky-vs","sky-fs");
+  gl.useProgram(skyProg);
+  skyProg.vertexPositionAttribute = gl.getAttribLocation(skyProg,"aVertexPosition");
+  skyProg.pMatrixUniform  = gl.getUniformLocation(skyProg,"uPMatrix");
+  skyProg.mvMatrixUniform = gl.getUniformLocation(skyProg,"uMVMatrix");
+  skyProg.samplerSkyUniform = gl.getUniformLocation(skyProg,"uSamplerSky");
+
+  // Obj/Sphere
+  var objP = createProg("obj-vs","obj-fs");
+  gl.useProgram(objP);
+  objP.vertexPositionAttribute = gl.getAttribLocation(objP,"aVertexPosition");
+  objP.vertexNormalAttribute   = gl.getAttribLocation(objP,"aVertexNormal");
+  objP.pMatrixUniform   = gl.getUniformLocation(objP,"uPMatrix");
+  objP.mvMatrixUniform  = gl.getUniformLocation(objP,"uMVMatrix");
+  objP.centerUniform       = gl.getUniformLocation(objP,"uCenter");
+  objP.samplerWaterUniform = gl.getUniformLocation(objP,"uSamplerWater");
+  objP.sphereRadiusUniform = gl.getUniformLocation(objP,"uSphereRadius");
+  objP.sphereCenterUniform = gl.getUniformLocation(objP,"uSphereCenter");
+  objP.isSphereUniform     = gl.getUniformLocation(objP,"uIsSphere");
+  objP.causticOnUniform    = gl.getUniformLocation(objP,"uCausticOn");
+  sand._objProg = objP;  // store on sand object for convenience
+
+  // Sand surface (two passes: front cull + back cull)
+  for(var i=0; i<2; i++) {
+    var sp = createProg("sand-vs","sand-fs");
+    gl.useProgram(sp);
+    sp.vertexPositionAttribute = gl.getAttribLocation(sp,"aVertexPosition");
+    sp.vertexNormalAttribute   = gl.getAttribLocation(sp,"aVertexNormal");
+    sp.pMatrixUniform    = gl.getUniformLocation(sp,"uPMatrix");
+    sp.mvMatrixUniform   = gl.getUniformLocation(sp,"uMVMatrix");
+    sp.nmlMatrixUniform  = gl.getUniformLocation(sp,"uNmlMatrix");
+    sp.rmvMatrixUniform  = gl.getUniformLocation(sp,"uReflectmvMatrix");
+    sp.rpMatrixUniform   = gl.getUniformLocation(sp,"uReflectpMatrix");
+    sp.samplerTileUniform  = gl.getUniformLocation(sp,"uSamplerTile");
+    sp.samplerWaterUniform = gl.getUniformLocation(sp,"uSamplerWater");
+    sp.eyePositionUniform  = gl.getUniformLocation(sp,"uEyePosition");
+    sp.sphereRadiusUniform = gl.getUniformLocation(sp,"uSphereRadius");
+    sp.sphereCenterUniform = gl.getUniformLocation(sp,"uSphereCenter");
+    sp.progNumUniform      = gl.getUniformLocation(sp,"uProgNum");
+    sandProg[i] = sp;
+  }
+
+  // Height, normal, simulate, sphere-interact
+  heightProg = createProg("interact-vs","interact-height-fs");
+  gl.useProgram(heightProg);
+  heightProg.vertexPositionAttribute = gl.getAttribLocation(heightProg,"aVertexPosition");
+  heightProg.samplerWaterUniform = gl.getUniformLocation(heightProg,"uSamplerWater");
+  heightProg.centerUniform   = gl.getUniformLocation(heightProg,"uCenter");
+  heightProg.radiusUniform   = gl.getUniformLocation(heightProg,"uRadius");
+  heightProg.strengthUniform = gl.getUniformLocation(heightProg,"uStrength");
+
+  normalProg = createProg("interact-vs","interact-normal-fs");
+  gl.useProgram(normalProg);
+  normalProg.vertexPositionAttribute = gl.getAttribLocation(normalProg,"aVertexPosition");
+  normalProg.samplerWaterUniform = gl.getUniformLocation(normalProg,"uSamplerWater");
+  normalProg.deltaUniform = gl.getUniformLocation(normalProg,"uDelta");
+
+  simulateProg = createProg("interact-vs","interact-simulate-fs");
+  gl.useProgram(simulateProg);
+  simulateProg.vertexPositionAttribute = gl.getAttribLocation(simulateProg,"aVertexPosition");
+  simulateProg.samplerWaterUniform = gl.getUniformLocation(simulateProg,"uSamplerWater");
+  simulateProg.deltaUniform   = gl.getUniformLocation(simulateProg,"uDelta");
+  simulateProg.dampingUniform = gl.getUniformLocation(simulateProg,"uDamping");
+
+  objectProg = createProg("interact-vs","interact-sphere-fs");
+  gl.useProgram(objectProg);
+  objectProg.vertexPositionAttribute = gl.getAttribLocation(objectProg,"aVertexPosition");
+  objectProg.samplerWaterUniform = gl.getUniformLocation(objectProg,"uSamplerWater");
+  objectProg.newCenterUniform = gl.getUniformLocation(objectProg,"uNewCenter");
+  objectProg.oldCenterUniform = gl.getUniformLocation(objectProg,"uOldCenter");
+  objectProg.radiusUniform    = gl.getUniformLocation(objectProg,"uRadius");
+
+  // Depth
+  depthProg = createProg("depth-vs","depth-fs");
+  gl.useProgram(depthProg);
+  depthProg.vertexPositionAttribute = gl.getAttribLocation(depthProg,"aVertexPosition");
+  depthProg.vertexNormalAttribute   = gl.getAttribLocation(depthProg,"aVertexNormal");
+  depthProg.pMatrixUniform  = gl.getUniformLocation(depthProg,"uPMatrix");
+  depthProg.mvMatrixUniform = gl.getUniformLocation(depthProg,"uMVMatrix");
+  depthProg.centerUniform   = gl.getUniformLocation(depthProg,"uCenter");
+  depthProg.modeUniform     = gl.getUniformLocation(depthProg,"uMode");
+
+  // Wind
+  windProg = createProg("interact-vs","perlin-fs");
+  gl.useProgram(windProg);
+  windProg.vertexPositionAttribute = gl.getAttribLocation(windProg,"aVertexPosition");
+  windProg.samplerWaterUniform = gl.getUniformLocation(windProg,"uSamplerWater");
+  // reuse perlin-vs for wind so we need the attributes from perlin-vs 
+  // Actually we use interact-vs (simpler) + perlin-fs — get time uniform
+  windProg.timeUniform = gl.getUniformLocation(windProg,"uTime");
+  windProg.samplerPermUniform = gl.getUniformLocation(windProg,"uSamplerPerm");
+  windProg.samplerGradUniform = gl.getUniformLocation(windProg,"uSamplerGrad");
+
+  // Quad
+  quadProg = createProg("quad-vs","quad-fs");
+  gl.useProgram(quadProg);
+  quadProg.vertexPositionAttribute = gl.getAttribLocation(quadProg,"aVertexPosition");
+  quadProg.textureCoordAttribute   = gl.getAttribLocation(quadProg,"aTextureCoord");
+  quadProg.samplerDepthUniform = gl.getUniformLocation(quadProg,"uSamplerDepth");
+  quadProg.modeUniform = gl.getUniformLocation(quadProg,"uMode");
+}
+
+function initBuffers(model, primitive) {
+  model.VBO = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,model.VBO); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(primitive.vertices),gl.STATIC_DRAW);
+  model.NBO = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,model.NBO); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(primitive.normals),gl.STATIC_DRAW);
+  model.TBO = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,model.TBO); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(primitive.texcoords),gl.STATIC_DRAW);
+  model.IBO = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,model.IBO); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(primitive.indices),gl.STATIC_DRAW);
+  model.IBO.numItems = primitive.numIndices;
+}
+
+function initCustomTexture(tex, format, filter, type, w, h, data, wS, wT) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,wS||gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,wT||gl.CLAMP_TO_EDGE);
+  data = data||null;
+  if(type==gl.FLOAT) gl.texImage2D(gl.TEXTURE_2D,0,format,w,h,0,format,type,data);
+  else               gl.texImage2D(gl.TEXTURE_2D,0,format,w,h,0,format,type,data);
+}
+
+function initTexture(tex, url) {
+  var img = new Image();
+  img.onload = function() {
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,1);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_NEAREST);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  };
+  img.src = url;
+}
+
+function initSkyBoxTexture() {
+  var ct=0, imgs=new Array(6);
+  var urls = ["skyright.jpg","skyleft.jpg","skyup.jpg","skydown.jpg","skyback.jpg","skyfront.jpg"];
+  for(var i=0;i<6;i++) {
+    imgs[i] = new Image();
+    imgs[i].onload = (function() {
+      ct++;
+      if(ct==6) {
+        sky.Texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_CUBE_MAP,sky.Texture);
+        var tgts = [gl.TEXTURE_CUBE_MAP_POSITIVE_X,gl.TEXTURE_CUBE_MAP_NEGATIVE_X,gl.TEXTURE_CUBE_MAP_POSITIVE_Y,gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,gl.TEXTURE_CUBE_MAP_POSITIVE_Z,gl.TEXTURE_CUBE_MAP_NEGATIVE_Z];
+        for(var j=0;j<6;j++) {
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+          gl.texImage2D(tgts[j],0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,imgs[j]);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+        }
+        gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+      }
+    });
+    imgs[i].src = urls[i];
+  }
+}
+
+function setMatrixUniforms(prog) {
+  gl.uniformMatrix4fv(prog.pMatrixUniform,false,pMatrix);
+  gl.uniformMatrix4fv(prog.mvMatrixUniform,false,mvMatrix);
+}
+
+function initFrameBuffer(coltex, deptex, w, h) {
+  framebuffer  = framebuffer  || gl.createFramebuffer();
+  renderbuffer = renderbuffer || gl.createRenderbuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);
+  gl.bindRenderbuffer(gl.RENDERBUFFER,renderbuffer);
+  framebuffer.width=w; framebuffer.height=h;
+  if(w!=renderbuffer.width||h!=renderbuffer.height) {
+    renderbuffer.width=w; renderbuffer.height=h;
+    gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,w,h);
+  }
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,coltex,0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,renderbuffer);
+}
+
+// ─── Mouse / Interaction ────────────────────────────────────────────────────
+function handleMouseDown(e) {
+  if(e.button==2) { mouseRightDown=true; mouseLeftDown=false; }
+  else { mouseLeftDown=true; mouseRightDown=false; startInteraction(e.clientX,e.clientY); }
+  lastMouseX=e.clientX; lastMouseY=e.clientY;
+}
+function handleMouseUp(e) { mouseLeftDown=mouseRightDown=false; }
+function handleMouseMove(e) {
+  if(!(mouseLeftDown||mouseRightDown)) return;
+  var dx=e.clientX-lastMouseX, dy=e.clientY-lastMouseY;
+  if(mouseLeftDown) { duringInteraction(e.clientX,e.clientY); }
+  else { azimuth+=0.01*dx; elevation+=0.01*dy; elevation=Math.min(Math.max(elevation,-Math.PI/2+0.001),Math.PI/2-0.001); }
+  eye=sphericalToCartesian(radius,azimuth,elevation);
+  view=mat4.create(); mat4.lookAt(eye,center,up,view);
+  lastMouseX=e.clientX; lastMouseY=e.clientY;
+}
+function handleMouseWheel(e) {
+  var move=(e.wheelDelta||(-e.deltaY*3))/240;
+  if(fov+move<90&&fov+move>20) fov+=move; return false;
+}
+// Touch
+function handleTouchStart(e) { e.preventDefault(); mouseLeftDown=true; var t=e.touches[0]; startInteraction(t.clientX,t.clientY); lastMouseX=t.clientX; lastMouseY=t.clientY; }
+function handleTouchMove(e)  { e.preventDefault(); if(!mouseLeftDown) return; var t=e.touches[0]; duringInteraction(t.clientX,t.clientY); lastMouseX=t.clientX; lastMouseY=t.clientY; }
+function handleTouchEnd(e)   { mouseLeftDown=false; }
+
+function startInteraction(x,y) {
+  initTracer();
+  var ray=rayEyeToPixel(x,y);
+  var hit=rayIntersectSphere(tracer.eye,ray,sphere.center,sphere.radius);
+  if(hit!=null) { preHit=hit; viewportNormal=rayEyeToPixel(gl.viewportWidth/2,gl.viewportHeight/2); vec3.negate(viewportNormal); mode=1; }
+  else {
+    var scale=-tracer.eye[1]/ray[1];
+    var pt=vec3.create([tracer.eye[0]+ray[0]*scale,tracer.eye[1]+ray[1]*scale,tracer.eye[2]+ray[2]*scale]);
+    if(Math.abs(pt[0])<1&&Math.abs(pt[2])<1) { drawHeight(pt[0],pt[2]); mode=0; }
+  }
+}
+function duringInteraction(x,y) {
+  var ray=rayEyeToPixel(x,y);
+  if(mode==0) {
+    var scale=-tracer.eye[1]/ray[1];
+    var pt=vec3.create([tracer.eye[0]+ray[0]*scale,tracer.eye[1]+ray[1]*scale,tracer.eye[2]+ray[2]*scale]);
+    if(Math.abs(pt[0])<1&&Math.abs(pt[2])<1) drawHeight(pt[0],pt[2]);
+  } else {
+    var theEye=vec3.create(tracer.eye), preRay=vec3.create(preHit), nxtRay=vec3.create(ray);
+    vec3.subtract(preRay,theEye);
+    var t1=vec3.dot(viewportNormal,preRay), t2=vec3.dot(viewportNormal,nxtRay), t=t1/t2;
+    vec3.scale(nxtRay,t);
+    var nxtHit=vec3.add(vec3.create(theEye),nxtRay);
+    var offset=vec3.subtract(vec3.create(nxtHit),preHit);
+    if(vec3.length(offset)>0) {
+      vec3.add(sphere.center,offset);
+      sphere.center[0]=Math.max(sphere.radius-1,Math.min(1-sphere.radius,sphere.center[0]));
+      sphere.center[1]=Math.max(sphere.radius-0.65,Math.min(10,sphere.center[1]));
+      sphere.center[2]=Math.max(sphere.radius-1,Math.min(1-sphere.radius,sphere.center[2]));
+    }
+    preHit=nxtHit;
+  }
+}
+
+// ─── GPU simulation passes ──────────────────────────────────────────────────
+function bindInteractVBO() {
+  gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO);
+}
+
+function drawHeight(x,y,r,s) {
+  r=r||0.03; s=s||(params.Strength||0.02);
+  initFrameBuffer(sand.TextureB,null,textureSize,textureSize);
+  gl.viewport(0,0,textureSize,textureSize);
+  gl.useProgram(heightProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO);
+  gl.vertexAttribPointer(heightProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(heightProg.vertexPositionAttribute);
+  gl.uniform2f(heightProg.centerUniform,x,y);
+  gl.uniform1f(heightProg.radiusUniform,r);
+  gl.uniform1f(heightProg.strengthUniform,s);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(heightProg.samplerWaterUniform,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO); gl.drawElements(gl.TRIANGLES,sand.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(heightProg.vertexPositionAttribute);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.bindRenderbuffer(gl.RENDERBUFFER,null);
+  gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);
+  var tmp=sand.TextureA; sand.TextureA=sand.TextureB; sand.TextureB=tmp;
+}
+
+function drawNormal() {
+  initFrameBuffer(sand.TextureB,null,textureSize,textureSize);
+  gl.viewport(0,0,textureSize,textureSize);
+  gl.useProgram(normalProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO);
+  gl.vertexAttribPointer(normalProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(normalProg.vertexPositionAttribute);
+  gl.uniform2f(normalProg.deltaUniform,1/textureSize,1/textureSize);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(normalProg.samplerWaterUniform,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO); gl.drawElements(gl.TRIANGLES,sand.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(normalProg.vertexPositionAttribute);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.bindRenderbuffer(gl.RENDERBUFFER,null);
+  gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);
+  var tmp=sand.TextureA; sand.TextureA=sand.TextureB; sand.TextureB=tmp;
+}
+
+function drawSimulation() {
+  initFrameBuffer(sand.TextureB,null,textureSize,textureSize);
+  gl.viewport(0,0,textureSize,textureSize);
+  gl.useProgram(simulateProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO);
+  gl.vertexAttribPointer(simulateProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(simulateProg.vertexPositionAttribute);
+  gl.uniform2f(simulateProg.deltaUniform,1/textureSize,1/textureSize);
+  gl.uniform1f(simulateProg.dampingUniform,params.Damping);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(simulateProg.samplerWaterUniform,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO); gl.drawElements(gl.TRIANGLES,sand.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(simulateProg.vertexPositionAttribute);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.bindRenderbuffer(gl.RENDERBUFFER,null);
+  gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);
+  var tmp=sand.TextureA; sand.TextureA=sand.TextureB; sand.TextureB=tmp;
+}
+
+function drawInteraction() {
+  initFrameBuffer(sand.TextureB,null,textureSize,textureSize);
+  gl.viewport(0,0,textureSize,textureSize);
+  gl.useProgram(objectProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO);
+  gl.vertexAttribPointer(objectProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(objectProg.vertexPositionAttribute);
+  gl.uniform3fv(objectProg.newCenterUniform,sphere.center);
+  gl.uniform3fv(objectProg.oldCenterUniform,sphere.oldcenter);
+  gl.uniform1f(objectProg.radiusUniform,sphere.radius);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(objectProg.samplerWaterUniform,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO); gl.drawElements(gl.TRIANGLES,sand.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(objectProg.vertexPositionAttribute);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.bindRenderbuffer(gl.RENDERBUFFER,null);
+  gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);
+  var tmp=sand.TextureA; sand.TextureA=sand.TextureB; sand.TextureB=tmp;
+}
+
+function drawWind() {
+  initFrameBuffer(sand.TextureB,null,textureSize,textureSize);
+  gl.viewport(0,0,textureSize,textureSize);
+  gl.useProgram(windProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO);
+  gl.vertexAttribPointer(windProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(windProg.vertexPositionAttribute);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(windProg.samplerWaterUniform,0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,permTexture); gl.uniform1i(windProg.samplerPermUniform,1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gradTexture); gl.uniform1i(windProg.samplerGradUniform,2);
+  accumTime+=0.04;
+  gl.uniform1f(windProg.timeUniform,accumTime);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO); gl.drawElements(gl.TRIANGLES,sand.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(windProg.vertexPositionAttribute);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.bindRenderbuffer(gl.RENDERBUFFER,null);
+  gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);
+  var tmp=sand.TextureA; sand.TextureA=sand.TextureB; sand.TextureB=tmp;
+}
+
+function drawDepth(colTex,depTex,mv,pr,model,rCol) {
+  initFrameBuffer(colTex,null,gl.viewportWidth,gl.viewportHeight);
+  gl.clear(gl.DEPTH_BUFFER_BIT|gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.colorMask(rCol,rCol,rCol,rCol);
+  gl.useProgram(depthProg);
+  gl.uniformMatrix4fv(depthProg.pMatrixUniform,false,pr);
+  gl.uniformMatrix4fv(depthProg.mvMatrixUniform,false,mv);
+  gl.bindBuffer(gl.ARRAY_BUFFER,model.VBO); gl.vertexAttribPointer(depthProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(depthProg.vertexPositionAttribute);
+  gl.bindBuffer(gl.ARRAY_BUFFER,model.NBO); gl.vertexAttribPointer(depthProg.vertexNormalAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(depthProg.vertexNormalAttribute);
+  gl.uniform3fv(depthProg.centerUniform,sphere.center);
+  gl.uniform1i(depthProg.modeUniform,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,model.IBO); gl.drawElements(gl.TRIANGLES,model.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(depthProg.vertexPositionAttribute); gl.disableVertexAttribArray(depthProg.vertexNormalAttribute);
+  gl.colorMask(true,true,true,true);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+
+function drawPool() {
+  gl.enable(gl.DEPTH_TEST); gl.useProgram(poolProg);
+  gl.enable(gl.CULL_FACE); gl.frontFace(gl.CCW); gl.cullFace(gl.FRONT);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pool.VBO); gl.vertexAttribPointer(poolProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(poolProg.vertexPositionAttribute);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pool.NBO); gl.vertexAttribPointer(poolProg.vertexNormalAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(poolProg.vertexNormalAttribute);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pool.TBO); gl.vertexAttribPointer(poolProg.textureCoordAttribute,2,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(poolProg.textureCoordAttribute);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,pool.Texture); gl.uniform1i(poolProg.samplerTileUniform,0);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(poolProg.samplerWaterUniform,2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,colorTexture); gl.uniform1i(poolProg.samplerDepthUniform,3);
+  setMatrixUniforms(poolProg);
+  gl.uniformMatrix4fv(poolProg.nmlMatrixUniform,false,nmlMatrix);
+  gl.uniformMatrix4fv(poolProg.lightMatrixUniform,false,lightMatrix);
+  gl.uniformMatrix4fv(poolProg.lightProjUniform,false,lightProj);
+  gl.uniform1f(poolProg.sphereRadiusUniform,sphere.radius);
+  gl.uniform3fv(poolProg.sphereCenterUniform,sphere.center);
+  gl.uniform1f(poolProg.causticOnUniform,0.0);
+  gl.uniform1i(poolProg.isSphereUniform,1);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,pool.IBO); gl.drawElements(gl.TRIANGLES,pool.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disable(gl.CULL_FACE);
+  gl.disableVertexAttribArray(poolProg.vertexPositionAttribute); gl.disableVertexAttribArray(poolProg.textureCoordAttribute); gl.disableVertexAttribArray(poolProg.vertexNormalAttribute);
+}
+
+function drawSkyBox() {
+  if(!sky.Texture) return;
+  gl.useProgram(skyProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sky.VBO); gl.vertexAttribPointer(skyProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(skyProg.vertexPositionAttribute);
+  setMatrixUniforms(skyProg);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_CUBE_MAP,sky.Texture); gl.uniform1i(skyProg.samplerSkyUniform,1);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sky.IBO); gl.drawElements(gl.TRIANGLES,sky.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(skyProg.vertexPositionAttribute);
+}
+
+function drawSphere() {
+  var op = sand._objProg;
+  gl.clear(gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE); gl.frontFace(gl.CCW); gl.cullFace(gl.BACK);
+  gl.useProgram(op);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sphere.VBO); gl.vertexAttribPointer(op.vertexPositionAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(op.vertexPositionAttribute);
+  gl.bindBuffer(gl.ARRAY_BUFFER,sphere.NBO); gl.vertexAttribPointer(op.vertexNormalAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(op.vertexNormalAttribute);
+  setMatrixUniforms(op);
+  gl.uniform3fv(op.centerUniform,sphere.center);
+  gl.uniform3fv(op.sphereCenterUniform,sphere.center);
+  gl.uniform1f(op.sphereRadiusUniform,sphere.radius);
+  gl.uniform1i(op.isSphereUniform,1);
+  gl.uniform1f(op.causticOnUniform,0.0);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(op.samplerWaterUniform,2);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sphere.IBO); gl.drawElements(gl.TRIANGLES,sphere.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(op.vertexPositionAttribute); gl.disableVertexAttribArray(op.vertexNormalAttribute);
+  gl.disable(gl.CULL_FACE);
+}
+
+function drawSandSurface() {
+  gl.enable(gl.CULL_FACE); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+  var dummy = mat4.ortho(-2,2,-2,2,-4,4);
+  var dummyMV = mat4.identity(mat4.create());
+  for(var i=0;i<2;i++) {
+    gl.cullFace(i?gl.BACK:gl.FRONT);
+    var sp=sandProg[i];
+    gl.useProgram(sp);
+    gl.bindBuffer(gl.ARRAY_BUFFER,sand.VBO); gl.vertexAttribPointer(sp.vertexPositionAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(sp.vertexPositionAttribute);
+    gl.bindBuffer(gl.ARRAY_BUFFER,sand.NBO); gl.vertexAttribPointer(sp.vertexNormalAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(sp.vertexNormalAttribute);
+    setMatrixUniforms(sp);
+    gl.uniformMatrix4fv(sp.nmlMatrixUniform,false,nmlMatrix);
+    gl.uniformMatrix4fv(sp.rmvMatrixUniform,false,dummyMV);
+    gl.uniformMatrix4fv(sp.rpMatrixUniform,false,dummy);
+    gl.uniform1i(sp.progNumUniform,i);
+    gl.uniform3fv(sp.sphereCenterUniform,sphere.center);
+    gl.uniform1f(sp.sphereRadiusUniform,sphere.radius);
+    gl.uniform3fv(sp.eyePositionUniform,eye);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,pool.Texture); gl.uniform1i(sp.samplerTileUniform,0);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,sand.TextureA); gl.uniform1i(sp.samplerWaterUniform,2);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,sand.IBO); gl.drawElements(gl.TRIANGLES,sand.IBO.numItems,gl.UNSIGNED_SHORT,0);
+    gl.disableVertexAttribArray(sp.vertexPositionAttribute); gl.disableVertexAttribArray(sp.vertexNormalAttribute);
+  }
+  gl.disable(gl.CULL_FACE);
+}
+
+function drawQuad(tex,mode) {
+  gl.useProgram(quadProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quad.VBO); gl.vertexAttribPointer(quadProg.vertexPositionAttribute,3,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(quadProg.vertexPositionAttribute);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quad.TBO); gl.vertexAttribPointer(quadProg.textureCoordAttribute,2,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(quadProg.textureCoordAttribute);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex); gl.uniform1i(quadProg.samplerDepthUniform,0);
+  gl.uniform1i(quadProg.modeUniform,mode);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,quad.IBO); gl.drawElements(gl.TRIANGLES,quad.IBO.numItems,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(quadProg.vertexPositionAttribute); gl.disableVertexAttribArray(quadProg.textureCoordAttribute);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+
+// ─── Main Draw Scene ─────────────────────────────────────────────────────────
+function drawScene() {
+  gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);
+  mat4.perspective(fov, gl.viewportWidth/gl.viewportHeight, 0.5, 40.0, pMatrix);
+  mat4.identity(mvMatrix); mat4.multiply(mvMatrix,view);
+  mat4.inverse(mvMatrix,nmlMatrix); mat4.transpose(nmlMatrix,nmlMatrix);
+
+  // Update sphere radius from UI
+  sphereRadius = parseFloat(document.getElementById('srad').value);
+  if(sphereRadius!=sphere.radius) {
+    var sObj=createSphere(sphereRadius,14,14);
+    initBuffers(sphere,sObj);
+    sphere.radius=sObj.radius;
+  }
+
+  var lightView=mat4.lookAt(lightInvDir,[0,0,0],[0,1,0]);
+  lightProj=mat4.ortho(-2,2,-2,2,-4,4);
+  mat4.identity(lightMatrix); mat4.multiply(lightMatrix,lightView);
+
+  // Shadow depth from light
+  drawDepth(colorTexture,depthTexture,lightMatrix,lightProj,sphere,false);
+
+  drawSkyBox();
+  drawPool();
+  drawSphere();
+  drawSandSurface();
+
+  drawNormal();
+  drawSimulation();
+  drawSimulation();
+  drawInteraction();
+
+  sphere.oldcenter=vec3.create(sphere.center);
+
+  if(params.Wind) drawWind();
+
+  if(params.Rain) {
+    if(rainCounter%25==0) {
+      var num=Math.random()*12+4;
+      for(var i=0;i<num;i++) drawHeight(Math.random()*2-1, Math.random()*2-1, Math.random()*0.025+0.01, Math.random()*0.035-0.005);
+    }
+    rainCounter++;
+  } else { rainCounter=0; }
+
+  if(params.Depth_From_Light) drawQuad(colorTexture,1);
+
+  initTracer();
+}
+
+function tick() {
+  var now=Date.now()/1000, elapsed=now-then; then=now;
+  totalTimeForFrames+=elapsed-(frameTimeHistory[frameTimeIndex]||0);
+  frameTimeHistory[frameTimeIndex]=elapsed;
+  frameTimeIndex=(frameTimeIndex+1)%numFramesToAverage;
+  var fps=1/(totalTimeForFrames/numFramesToAverage);
+  document.getElementById('fps').textContent=fps.toFixed(0);
+  requestAnimFrame(tick);
+  drawScene();
+}
+
+// ─── UI ──────────────────────────────────────────────────────────────────────
+function bindUI() {
+  function rangeEl(id,paramKey) {
+    var el=document.getElementById(id), val=document.getElementById(id+'-val');
+    el.addEventListener('input',function(){params[paramKey]=parseFloat(el.value); val.textContent=el.value;});
+  }
+  rangeEl('damp','Damping');
+  rangeEl('strength','Strength');
+
+  function toggleBtn(id,key) {
+    document.getElementById(id).addEventListener('click',function(){
+      params[key]=!params[key]; this.classList.toggle('on',params[key]);
+    });
+  }
+  toggleBtn('btn-wind','Wind');
+  toggleBtn('btn-rain','Rain');
+  toggleBtn('btn-depth','Depth_From_Light');
+
+  document.getElementById('btn-clear').addEventListener('click',function(){
+    var filter=OES_texture_float_linear?gl.LINEAR:gl.NEAREST;
+    initCustomTexture(sand.TextureA,gl.RGBA,filter,gl.FLOAT,textureSize,textureSize);
+    initCustomTexture(sand.TextureB,gl.RGBA,filter,gl.FLOAT,textureSize,textureSize);
+  });
+}
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+function webGLStart() {
+  var canvas = document.getElementById('the-canvas');
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  initGL(canvas);
+
+  canvas.onmousedown    = handleMouseDown;
+  canvas.oncontextmenu  = function(){ return false; };
+  canvas.onmousewheel   = handleMouseWheel;
+  canvas.addEventListener('wheel',handleMouseWheel,{passive:true});
+  document.onmouseup    = handleMouseUp;
+  document.onmousemove  = handleMouseMove;
+  canvas.addEventListener('touchstart',handleTouchStart,{passive:false});
+  canvas.addEventListener('touchmove', handleTouchMove, {passive:false});
+  canvas.addEventListener('touchend',  handleTouchEnd,  {passive:true});
+
+  window.addEventListener('resize',function(){
+    canvas.width=window.innerWidth; canvas.height=window.innerHeight;
+    gl.viewportWidth=canvas.width; gl.viewportHeight=canvas.height;
+  });
+
+  OES_texture_float_linear = gl.getExtension('OES_texture_float_linear');
+  OES_texture_float        = gl.getExtension('OES_texture_float');
+  OES_standard_derivatives = gl.getExtension('OES_standard_derivatives');
+  WEBGL_depth_texture      = gl.getExtension('WEBGL_depth_texture');
+  if(!OES_texture_float) { alert('OES_texture_float required'); return; }
+
+  initShaders();
+
+  var sObj = createSphere(sphereRadius,14,14);
+  initBuffers(sky,  cubeSky);
+  initBuffers(pool, cubePool);
+  initBuffers(sphere, sObj);
+  initBuffers(sand, planeWater);
+  initBuffers(quad, screenQuad);
+
+  sphere.center    = vec3.create([0,0.6,0]);
+  sphere.oldcenter = vec3.create(sphere.center);
+  sphere.radius    = sObj.radius;
+
+  pool.Texture  = gl.createTexture();
+  sand.TextureA = gl.createTexture();
+  sand.TextureB = gl.createTexture();
+  depthTexture  = gl.createTexture();
+  colorTexture  = gl.createTexture();
+  depthTexture2 = gl.createTexture();
+  colorTexture2 = gl.createTexture();
+  permTexture   = gl.createTexture();
+  gradTexture   = gl.createTexture();
+
+  var filter = OES_texture_float_linear ? gl.LINEAR : gl.NEAREST;
+  initCustomTexture(sand.TextureA, gl.RGBA, filter, gl.FLOAT, textureSize, textureSize);
+  initCustomTexture(sand.TextureB, gl.RGBA, filter, gl.FLOAT, textureSize, textureSize);
+  initCustomTexture(colorTexture,  gl.RGBA, gl.NEAREST, gl.UNSIGNED_BYTE, gl.viewportWidth, gl.viewportHeight);
+  initCustomTexture(colorTexture2, gl.RGBA, gl.NEAREST, gl.UNSIGNED_BYTE, gl.viewportWidth, gl.viewportHeight);
+
+  initTexture(pool.Texture, 'tile/tile3.jpg');
+
+  var permArr = new Uint8Array(perm);
+  var gradArr = new Uint8Array(grad);
+  initCustomTexture(permTexture, gl.ALPHA, gl.NEAREST, gl.UNSIGNED_BYTE, 256,  1, permArr, gl.REPEAT, gl.CLAMP_TO_EDGE);
+  initCustomTexture(gradTexture, gl.RGB,   gl.NEAREST, gl.UNSIGNED_BYTE,  16,  1, gradArr, gl.REPEAT, gl.CLAMP_TO_EDGE);
+
+  initSkyBoxTexture();
+
+  gl.clearColor(0.05,0.03,0.01,1.0);
+  gl.enable(gl.DEPTH_TEST);
+
+  eye  = sphericalToCartesian(radius, azimuth, elevation);
+  view = mat4.create(); mat4.lookAt(eye, center, up, view);
+
+  bindUI();
+  tick();
+}
+</script>
+</body>
+</html>
