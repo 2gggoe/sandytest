@@ -49,7 +49,7 @@
     var eyePos;
     var radius = 4.0;
     var azimuth = 0.5*Math.PI;
-    var elevation = 0.5;
+    var elevation = 0.8;
     var fov = 45.0;
     var eye = sphericalToCartesian(radius, azimuth, elevation);
     var center = [0.0, 0.0, 0.0];
@@ -221,11 +221,11 @@
     };
 
     var parameters = new function(){
-        this.Caustic = true;
+        this.Caustic = false;
 
-        this.Object = "duck";
+        this.Object = "sphere";
         this.Pool_Pattern = "white brick";
-        this.Sphere_Radius = 0.25;        
+        this.Sphere_Radius = 0.22;        
         this.Wind = true;
         this.Rain = false;
         this.Depth_From_Light = false;
@@ -1950,7 +1950,10 @@ function tick() {
 
 
 function webGLStart() {
+    // Set canvas to full window size before initGL reads canvas.width
     var canvas = document.getElementById("the-canvas");
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
     initGL(canvas);
 
     canvas.onmousedown = handleMouseDown;
@@ -1982,7 +1985,7 @@ function webGLStart() {
   initBuffers(sphere, sphereObj);
   initBuffers(water, planeWater);
   initBuffers(quad, screenQuad);
-  sphere.center = vec3.create([0.0,1.0,0.0]);
+  sphere.center = vec3.create([0.0,0.22,0.0]);
   sphere.oldcenter = vec3.create(sphere.center);
   sphere.radius = sphereObj.radius;
 
